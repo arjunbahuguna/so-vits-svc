@@ -25,20 +25,12 @@ hps = utils.get_hparams_from_file("configs/config.json")
 dconfig = du.load_config("configs/diffusion.yaml")
 sampling_rate = hps.data.sampling_rate
 hop_length = hps.data.hop_length
-speech_encoder = hps["model"]["speech_encoder"]
 
-
-def process_one(filename, hmodel, f0p, device, diff=False, mel_extractor=None):
+def process_one(filename, f0p, device, diff=False, mel_extractor=None):
     wav, sr = librosa.load(filename, sr=sampling_rate)
     audio_norm = torch.FloatTensor(wav)
     audio_norm = audio_norm.unsqueeze(0)
-    soft_path = filename + ".soft.pt"
-    if not os.path.exists(soft_path):
-        wav16k = librosa.resample(wav, orig_sr=sampling_rate, target_sr=16000)
-        wav16k = torch.from_numpy(wav16k).to(device)
-        c = hmodel.encoder(wav16k)
-        torch.save(c.cpu(), soft_path)
-
+    
     f0_path = filename + ".f0.npy"
     if not os.path.exists(f0_path):
         f0_predictor = utils.get_f0_predictor(f0p,sampling_rate=sampling_rate, hop_length=hop_length,device=None,threshold=0.05)
@@ -47,21 +39,14 @@ def process_one(filename, hmodel, f0p, device, diff=False, mel_extractor=None):
         )
         np.save(f0_path, np.asanyarray((f0,uv),dtype=object))
 
-
     spec_path = filename.replace(".wav", ".spec.pt")
     if not os.path.exists(spec_path):
-        # Process spectrogram
-        # The following code can't be replaced by torch.FloatTensor(wav)
-        # because load_wav_to_torch return a tensor that need to be normalized
-
         if sr != hps.data.sampling_rate:
             raise ValueError(
                 "{} SR doesn't match target {} SR".format(
                     sr, hps.data.sampling_rate
                 )
             )
-
-        #audio_norm = audio / hps.data.max_wav_value
 
         spec = spectrogram_torch(
             audio_norm,
@@ -102,19 +87,10 @@ def process_one(filename, hmodel, f0p, device, diff=False, mel_extractor=None):
         if not os.path.exists(aug_vol_path):
             np.save(aug_vol_path,aug_vol.to('cpu').numpy())
 
-
 def process_batch(file_chunk, f0p, diff=False, mel_extractor=None, device="cpu"):
-    logger.info("Loading speech encoder for content...")
-    rank = mp.current_process()._identity
-    rank = rank[0] if len(rank) > 0 else 0
-    if torch.cuda.is_available():
-        gpu_id = rank % torch.cuda.device_count()
-        device = torch.device(f"cuda:{gpu_id}")
-    logger.info(f"Rank {rank} uses device {device}")
-    hmodel = utils.get_speech_encoder(speech_encoder, device=device)
-    logger.info(f"Loaded speech encoder for rank {rank}")
-    for filename in tqdm(file_chunk, position = rank):
-        process_one(filename, hmodel, f0p, device, diff, mel_extractor)
+    logger.info(f"Rank {mp.current_process()._identity[0] if mp.current_process()._identity else 0} uses device {device}")
+    for filename in tqdm(file_chunk, position = 0):
+        process_one(filename, f0p, device, diff, mel_extractor)
 
 def parallel_process(filenames, num_processes, f0p, diff, mel_extractor, device):
     with ProcessPoolExecutor(max_workers=num_processes) as executor:
@@ -148,20 +124,18 @@ if __name__ == "__main__":
     if device is None:
         device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 
-    print(speech_encoder)
     logger.info("Using device: " + str(device))
-    logger.info("Using SpeechEncoder: " + speech_encoder)
     logger.info("Using extractor: " + f0p)
     logger.info("Using diff Mode: " + str(args.use_diff))
 
     if args.use_diff:
-        print("use_diff")
-        print("Loading Mel Extractor...")
+        logger.info("Loading Mel Extractor...")
         mel_extractor = Vocoder(dconfig.vocoder.type, dconfig.vocoder.ckpt, device=device)
-        print("Loaded Mel Extractor.")
+        logger.info("Loaded Mel Extractor.")
     else:
         mel_extractor = None
-    filenames = glob(f"{args.in_dir}/*/*.wav", recursive=True)  # [:10]
+
+    filenames = glob(f"{args.in_dir}/*/*.wav", recursive=True)
     shuffle(filenames)
     mp.set_start_method("spawn", force=True)
 
